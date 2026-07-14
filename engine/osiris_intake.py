@@ -41,7 +41,10 @@ FEEDS = [
     ("/api/wiki-attention", "wikipedia", "attention"),
     ("/api/ioda", "ioda", "outage"),
     ("/api/space-weather", "swpc", "space-weather"),
-    ("/api/crypto", "crypto", "markets"),
+    # /api/crypto removed 2026-07-14: its shape changed to a bare [{symbol,price}]
+    # list (no change_percent) that _markets_events can't read — and /api/markets
+    # already carries Bitcoin+Ethereum WITH change data. Re-add only with a
+    # dedicated handler and a reason to want static quotes.
     ("/api/frontlines", "frontlines", "conflict"),
     ("/api/displacement", "unhcr", "displacement"),
     ("/api/economy", "worldbank", "economy"),
@@ -906,7 +909,7 @@ class OsirisIntake:
             r = await c.get(f"{self.base}{path}", timeout=35)
             if r.status_code < 400:
                 data = r.json()
-                if source in ("markets", "crypto"):
+                if source == "markets":
                     out.extend(_markets_events(data, source))
                 elif source == "risk":
                     out.extend(_country_risk_events(data))
