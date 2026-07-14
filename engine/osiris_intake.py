@@ -46,7 +46,6 @@ FEEDS = [
     ("/api/censorship", "ooni", "censorship"),
     ("/api/health-outbreaks", "who", "health"),
     ("/api/unrest", "unrest", "unrest"),
-    ("/api/food-security", "hungermap", "food"),
     ("/api/kev", "cisa-kev", "cyber"),
     ("/api/faa-status", "faa", "aviation"),
     ("/api/unemployment", "wb-unemployment", "economy"),
