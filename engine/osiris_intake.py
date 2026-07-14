@@ -458,6 +458,46 @@ def _country_risk_events(data: dict) -> list[WorldEvent]:
     return out
 
 
+# zones are STANDING conflict baselines ("UKRAINE WAR" is always true), so —
+# like country-risk — they cap at 0.5 and can never outrank live signal. The
+# generic path would have scored them by _HOT words: a permanent 1.0 for any
+# zone with "war" in its label, drowning actual news. A missile landing is
+# news; a warzone existing is context.
+_ZONE_SEV = {"war": 0.5, "high": 0.4, "elevated": 0.3}
+
+
+def _conflict_events(data: dict) -> list[WorldEvent]:
+    """Osiris conflicts carries TWO lists the generic path could never see
+    together: `zones` (hand-curated standing warzones, titled by `label`) and
+    `liveEvents` (OSINT news items, titled by `title`). _find_items returned
+    only the first list, and zone items have no title-ish key — so during an
+    active war this feed yielded exactly nothing."""
+    out: list[WorldEvent] = []
+    for z in (data or {}).get("zones", []) or []:
+        if not isinstance(z, dict):
+            continue
+        label = str(z.get("label") or "").strip()
+        if not label:
+            continue
+        sev = str(z.get("severity") or "").lower()
+        out.append(WorldEvent(
+            title=f"Conflict zone: {label} ({sev or 'active'})"[:240],
+            summary=(f"{str(z.get('description') or '').strip()} "
+                     "Standing conflict baseline, not a live event.").strip()[:2000],
+            category="conflict", source="conflicts",
+            lat=z.get("lat"), lng=z.get("lng"),
+            url=str(z.get("sourceUrl") or ""),
+            salience=_ZONE_SEV.get(sev, 0.3),
+        ))
+    for e in (data or {}).get("liveEvents", []) or []:
+        if not isinstance(e, dict):
+            continue
+        ev = _to_event(e, "conflicts", "conflict")   # real news: title, coords, url
+        if ev:
+            out.append(ev)
+    return out
+
+
 def _space_weather_events(data: dict) -> list[WorldEvent]:
     """NOAA SWPC — geomagnetic storms + solar flares (satellites, GPS, grids)."""
     out = []
@@ -870,6 +910,8 @@ class OsirisIntake:
                     out.extend(_markets_events(data, source))
                 elif source == "risk":
                     out.extend(_country_risk_events(data))
+                elif source == "conflicts":
+                    out.extend(_conflict_events(data))
                 elif source == "futures":
                     out.extend(_futures_events(data))
                 elif source == "gdacs":
