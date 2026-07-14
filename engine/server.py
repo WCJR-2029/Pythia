@@ -208,6 +208,19 @@ async def agent_events(domain: str | None = None, source: str | None = None,
             "domains_available": sorted({e.category for e in STATE.events})}
 
 
+@app.get("/agent/feeds")
+async def agent_feeds():
+    """Per-feed yield report from the latest intake pass — the zero-yield alarm's
+    detail view. Statuses: ok | empty | quiet-filter | degraded | fetch-fail |
+    dropped. `dropped` (raw rows exist, zero ingested) is always a code defect.
+    A long `streak` on `empty` is either a quiet world (NHC in January) or a dead
+    upstream returning honest-looking nothing (air-quality) — this report can't
+    tell those apart, but a human reading it can."""
+    from .runtime import intake
+    return intake.last_report or {"ts": None, "feeds": [],
+                                  "note": "no intake pass has completed yet"}
+
+
 @app.get("/scorecard")
 async def scorecard():
     """PYTHIA's track record. Every forecast is persisted when made; an LLM judge

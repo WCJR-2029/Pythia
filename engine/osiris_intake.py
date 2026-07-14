@@ -9,12 +9,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections import Counter
 from datetime import datetime, timezone
 
 import httpx
 
 from .config import CONFIG, HTTPX_VERIFY
-from .models import WorldEvent
+from .models import WorldEvent, now_ms
 
 log = logging.getLogger("pythia.intake")
 
@@ -90,6 +91,52 @@ def _find_items(data) -> list[dict]:
             if isinstance(v, list) and v and isinstance(v[0], dict):
                 return v
     return []
+
+
+# ── Zero-yield alarm ────────────────────────────────────────────────────────
+# Every bug found in the 2026-07-14 audit shared one shape: a feed that fetched
+# fine but yielded zero events — indistinguishable from a quiet world. These
+# helpers classify each feed's pass so that "intake dropped everything" (a code
+# defect) can never again masquerade as "nothing happening" (a world state).
+
+# Feeds whose handler DELIBERATELY filters, so zero events from non-zero raw
+# rows is a legitimate quiet day, not a defect. Enumerated explicitly — an
+# unlisted feed that drops everything is treated as broken, never excused.
+ZERO_YIELD_OK = {
+    "glofas": "only basins with forecast discharge >=2x median are emitted",
+    "wikipedia": "only attention spikes >=2x or chart debuts are emitted",
+    "geohazards": "routine info-level tsunami statements are dropped as noise",
+    "sec-edgar": "routine insider grants/exercises are dropped; a quiet tape is real",
+}
+
+
+def _raw_rows(data) -> int:
+    """Best-effort count of raw rows in a feed payload — the denominator for the
+    zero-yield alarm. Deliberately generous: the largest top-level list counts,
+    a dict of quote-groups counts, a non-empty `summary` string counts as one."""
+    if isinstance(data, list):
+        return len(data)
+    if isinstance(data, dict):
+        n = max((len(v) for v in data.values() if isinstance(v, list)), default=0)
+        if n == 0:
+            n = sum(1 for v in data.values() if isinstance(v, dict))
+        if n == 0 and isinstance(data.get("summary"), str) and data["summary"].strip():
+            n = 1
+        return n
+    return 0
+
+
+def _payload_error(data) -> str:
+    """Route-level honesty marker. Osiris routes return HTTP 200 with an `error`
+    field (gdp-growth) or a `*_ok: false` flag (space-weather) when THEIR
+    upstream failed — without this check, 'upstream down' reads as 'quiet'."""
+    if not isinstance(data, dict):
+        return ""
+    err = data.get("error")
+    if isinstance(err, str) and err.strip():
+        return err.strip()[:200]
+    flags = [k for k, v in data.items() if k.endswith("_ok") and v is False]
+    return f"route flags {', '.join(flags)}" if flags else ""
 
 
 def _text(d: dict, *keys: str) -> str:
@@ -789,6 +836,8 @@ def _unrest_events(data: dict) -> list[WorldEvent]:
 class OsirisIntake:
     def __init__(self, base_url: str | None = None):
         self.base = (base_url or CONFIG.osiris_url).rstrip("/")
+        self.last_report: dict | None = None   # per-feed yield report from the latest pass
+        self._streak: dict[str, int] = {}      # source -> consecutive bad passes
 
     async def health(self) -> bool:
         try:
@@ -798,8 +847,19 @@ class OsirisIntake:
         except Exception:  # noqa: BLE001 — health is a status dot; never raise
             return False
 
-    async def _fetch_feed(self, c: httpx.AsyncClient, path: str, source: str, category: str) -> list[WorldEvent]:
+    async def _fetch_feed(self, c: httpx.AsyncClient, path: str, source: str, category: str) -> tuple[list[WorldEvent], dict]:
+        """Fetch one feed and normalize it. Returns (events, report); the report
+        classifies the pass for the zero-yield alarm in fetch():
+          ok           events flowed
+          empty        fetch OK, zero raw rows — a genuinely quiet feed
+          quiet-filter fetch OK, raw rows exist, handler filtered all (ZERO_YIELD_OK)
+          degraded     fetch OK but the route flagged its own upstream as failed
+          fetch-fail   HTTP/network/parse error
+          dropped      fetch OK, raw rows exist, intake yielded NOTHING — code defect
+        """
         out: list[WorldEvent] = []
+        report = {"path": path, "source": source, "status": "ok",
+                  "events": 0, "raw": 0, "note": ""}
         try:
             # generous: Next.js compiles each route on first hit (cold start), and a few
             # feeds (e.g. /api/unrest aggregates many GDELT files) are slow until cached.
@@ -871,15 +931,79 @@ class OsirisIntake:
                         ev = _to_event(d, source, category)
                         if ev:
                             out.append(ev)
+                report["events"], report["raw"] = len(out), _raw_rows(data)
+                err = _payload_error(data)
+                if out:
+                    if err:
+                        report["note"] = f"partial: {err}"
+                elif err:
+                    report["status"], report["note"] = "degraded", err
+                elif report["raw"] == 0:
+                    report["status"] = "empty"
+                elif source in ZERO_YIELD_OK:
+                    report["status"], report["note"] = "quiet-filter", ZERO_YIELD_OK[source]
+                else:
+                    report["status"] = "dropped"
+            else:
+                report["status"], report["note"] = "fetch-fail", f"HTTP {r.status_code}"
+                log.warning("feed %s fetch failed: HTTP %s", path, r.status_code)
         except (httpx.HTTPError, ValueError) as e:
-            log.debug("feed %s failed: %s", path, e)
-        return out
+            report["status"], report["note"] = "fetch-fail", str(e)[:200]
+            log.warning("feed %s fetch failed: %s", path, e)
+        return out, report
+
+    def _alarm_events(self, reports: list[dict]) -> list[WorldEvent]:
+        """Turn bad feed reports into synthetic `system` events so a broken sensor
+        surfaces everywhere the world does (UI, brief, MCP, webhooks) — nobody
+        should have to go looking. Titles are stable so webhook dedupe fires once.
+        `dropped` alarms immediately (a code defect is deterministic); transient
+        fetch/upstream failures only alarm after 3 consecutive passes (~9 min)."""
+        alarms: list[WorldEvent] = []
+        for rep in reports:
+            src, st = rep["source"], rep["status"]
+            if st in ("dropped", "degraded", "fetch-fail", "empty"):
+                self._streak[src] = self._streak.get(src, 0) + 1
+            else:
+                self._streak.pop(src, None)
+            rep["streak"] = self._streak.get(src, 0)
+            if st == "dropped":
+                log.error("feed %s: %d raw rows fetched, 0 events ingested — intake is "
+                          "dropping everything (code defect, not a quiet world)",
+                          rep["path"], rep["raw"])
+                alarms.append(WorldEvent(
+                    title=f"SENSOR FAULT: {src} feed yields 0 events despite raw data",
+                    summary=(f"{rep['path']} returned {rep['raw']} raw rows this pass but "
+                             "intake ingested none of them. A dropped-everything feed is a "
+                             "code defect in engine intake, not a quiet world. "
+                             "Details: GET /agent/feeds."),
+                    category="system", source="sensor", salience=0.85,
+                ))
+            elif st in ("fetch-fail", "degraded") and rep["streak"] >= 3:
+                log.warning("feed %s %s for %d consecutive passes (%s)",
+                            rep["path"], st, rep["streak"], rep["note"] or "no detail")
+                alarms.append(WorldEvent(
+                    title=f"SENSOR DOWN: {src} feed unreadable ({st})",
+                    summary=(f"{rep['path']} has been {st} for {rep['streak']} consecutive "
+                             f"passes: {rep['note'] or 'no detail'}. Its silence means "
+                             "'unknown', not 'nothing happening'. Details: GET /agent/feeds."),
+                    category="system", source="sensor", salience=0.7,
+                ))
+        return alarms
 
     async def fetch(self, limit: int = 40) -> list[WorldEvent]:
         # Fetch feeds concurrently so one slow/dead feed (e.g. GDELT) can't starve the rest.
         async with httpx.AsyncClient(verify=HTTPX_VERIFY, timeout=25) as c:
-            batches = await asyncio.gather(*[self._fetch_feed(c, p, s, cat) for p, s, cat in FEEDS])
-        events: list[WorldEvent] = [ev for batch in batches for ev in batch]
+            results = await asyncio.gather(*[self._fetch_feed(c, p, s, cat) for p, s, cat in FEEDS])
+        events: list[WorldEvent] = [ev for evs, _ in results for ev in evs]
+        reports = [rep for _, rep in results]
+        alarms = self._alarm_events(reports)
+        counts = Counter(rep["status"] for rep in reports)
+        dropped = [rep["source"] for rep in reports if rep["status"] == "dropped"]
+        log.info("intake pass: %d events from %d feeds — %s%s",
+                 len(events), len(FEEDS),
+                 ", ".join(f"{k} {v}" for k, v in sorted(counts.items())),
+                 f"; DROPPING: {', '.join(dropped)}" if dropped else "")
+        self.last_report = {"ts": now_ms(), "feeds": reports}
         # dedupe by lowercased title, keep highest salience, sort
         seen: dict[str, WorldEvent] = {}
         for ev in events:
@@ -887,4 +1011,5 @@ class OsirisIntake:
             if key not in seen or ev.salience > seen[key].salience:
                 seen[key] = ev
         ranked = sorted(seen.values(), key=lambda e: e.salience, reverse=True)
-        return ranked[:limit]
+        # alarms ride in front so no salience cut can ever hide a broken sensor
+        return (alarms + ranked)[:limit]
