@@ -27,7 +27,10 @@ FEEDS = [
     ("/api/earthquakes", "usgs", "seismic"),
     ("/api/weather", "eonet", "weather"),
     ("/api/fires", "firms", "wildfire"),
-    ("/api/air-quality", "openaq", "air-quality"),
+    # /api/air-quality removed 2026-07-14: OpenAQ v2 is permanently retired
+    # (HTTP 410) and v3 needs an API key, so the route returns an honest-looking
+    # empty forever. Re-add only after migrating the osiris route to v3 (key in
+    # osiris .env, never in code).
     ("/api/country-risk", "risk", "instability"),
     ("/api/cyber-threats", "cyber", "cyber"),
     ("/api/infrastructure", "infra", "infrastructure"),
