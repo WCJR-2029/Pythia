@@ -20,7 +20,13 @@ export async function GET() {
     if (!res.ok) throw new Error(`adsb.lol ${res.status}`);
     const j = await res.json();
     const ac = (j.ac || [])
-      .filter((a: any) => typeof a.lat === 'number' && typeof a.lon === 'number')
+      // object guard (a null row must not throw), plausible coordinates only,
+      // and AIRBORNE only — adsb.lol reports parked aircraft as alt_baro:'ground',
+      // and tarmac rows inflating an "air posture" count is a lie (5% on live data).
+      .filter((a: any) => a && typeof a === 'object'
+        && typeof a.lat === 'number' && typeof a.lon === 'number'
+        && Math.abs(a.lat) <= 90 && Math.abs(a.lon) <= 180
+        && a.alt_baro !== 'ground')
       .slice(0, 600)
       .map((a: any) => ({
         hex: a.hex,
@@ -32,7 +38,11 @@ export async function GET() {
         alt: typeof a.alt_baro === 'number' ? a.alt_baro : null,
         gs: a.gs ?? null,
       }));
-    const body = { now: j.now, total: j.total ?? ac.length, ac };
+    // total = upstream's count (numeric or bust); returned = what survived the
+    // filters above. Downstream must not mix them up.
+    const body = { now: j.now,
+      total: Number.isFinite(j.total) ? j.total : ac.length,
+      returned: ac.length, ac };
     cache = { ts: Date.now(), body };
     return NextResponse.json(body);
   } catch (e) {

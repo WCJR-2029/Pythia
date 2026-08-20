@@ -900,7 +900,9 @@ def _wmo_events(data: dict) -> list[WorldEvent]:
         raw={},
     )]
     seen: set[str] = set()
-    for a in (data.get("extreme") or [])[:8]:
+    for a in (data.get("extreme") or []):
+        if len(seen) >= 8:      # dedupe across the FULL list, then cap
+            break
         key = f"{a.get('cc')}|{a.get('event')}"
         if key in seen:
             continue
@@ -963,7 +965,9 @@ def _ransomware_events(data: dict) -> list[WorldEvent]:
         category="cyber", source="ransomware", lat=None, lng=None,
         url="https://www.ransomware.live", salience=0.4, raw={},
     )]
-    cutoff = datetime.now(timezone.utc).timestamp() - 48 * 3600
+    now_s = datetime.now(timezone.utc).timestamp()
+    cutoff = now_s - 48 * 3600
+    horizon = now_s + 3600   # future-dated claims are junk, not perpetually fresh
     critical = re.compile(
         r"financial|health|hospital|energy|utilit|government|defen[cs]e|transport|telecom|water",
         re.I)
@@ -973,7 +977,8 @@ def _ransomware_events(data: dict) -> list[WorldEvent]:
             ts = datetime.fromisoformat(str(v.get("discovered", "")).replace("Z", "+00:00"))
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
-            if ts.timestamp() < cutoff:
+            t = ts.timestamp()
+            if t < cutoff or t > horizon:
                 continue
         except ValueError:
             continue

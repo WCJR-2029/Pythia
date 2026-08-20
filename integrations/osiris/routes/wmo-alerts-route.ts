@@ -23,7 +23,9 @@ export async function GET() {
     const res = await fetch(URL, { signal: AbortSignal.timeout(20000), cache: 'no-store' });
     if (!res.ok) throw new Error(`WMO ${res.status}`);
     const j = await res.json();
-    const items = (j.items || []).filter((i: any) => (i.s || 0) >= 3);
+    const items = (j.items || [])
+      .filter((i: any) => i && typeof i === 'object' && (Number(i.s) || 0) >= 3)
+      .map((i: any) => ({ ...i, s: Number(i.s) || 0 }));
     // Country: CAP OID ids embed the ISO 3166 numeric code ("urn:oid:2.49.0.1.840..."
     // -> 840 = US); some agencies use "IN-..." ids or an "in-ndma-xx/..." url instead.
     const cc = (i: any) => {
@@ -44,8 +46,17 @@ export async function GET() {
       g.sMax = Math.max(g.sMax, i.s || 0);
       groups.set(key, g);
     }
+    const seenX = new Set<string>();
     const extreme = items
       .filter((i: any) => i.s === 4)
+      // dedupe by country+event BEFORE capping, so 20 copies of one storm can't
+      // crowd every other country's extreme alert out of the window
+      .filter((i: any) => {
+        const k = `${cc(i)}|${i.event}`;
+        if (seenX.has(k)) return false;
+        seenX.add(k);
+        return true;
+      })
       .slice(0, 20)
       .map((i: any) => ({
         cc: cc(i),
@@ -60,7 +71,9 @@ export async function GET() {
       total_alerts: (j.items || []).length,
       severe: items.length,
       extreme_count: items.filter((i: any) => i.s === 4).length,
-      countries: new Set(items.map(cc)).size,
+      // '??' is "country unresolved", not a country — counting it as one nation
+      // silently merges every unresolved agency into a fake state
+      countries: new Set(items.map(cc)).size - (items.some((i: any) => cc(i) === '??') ? 1 : 0),
       extreme,
       groups: [...groups.values()].sort((a, b) => b.sMax - a.sMax || b.n - a.n).slice(0, 40),
     };
