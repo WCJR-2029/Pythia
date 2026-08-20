@@ -68,6 +68,10 @@ FEEDS = [
     ("/api/geohazards", "geohazards", "disaster"),
     ("/api/ofac", "ofac", "geopolitical"),
     ("/api/hackernews", "hackernews", "attention"),
+    # 2026-08-20 World Monitor cherry-pick (all keyless, live-verified at adoption):
+    ("/api/wmo-alerts", "wmo", "weather"),
+    ("/api/mil-flights", "adsb-mil", "military"),
+    ("/api/ransomware", "ransomware", "cyber"),
 ]
 
 # Words that raise an event's salience (drives auto-scan selection).
@@ -879,6 +883,114 @@ def _unrest_events(data: dict) -> list[WorldEvent]:
     return out
 
 
+def _wmo_events(data: dict) -> list[WorldEvent]:
+    """WMO SWIC global CAP alerts: official severe weather from member met
+    agencies worldwide — the global layer above the US-only NWS view. One
+    rollup always, plus individual events for the Extreme (s=4) alerts."""
+    severe, extreme = data.get("severe", 0), data.get("extreme_count", 0)
+    countries = data.get("countries", 0)
+    groups = data.get("groups") or []
+    top = " · ".join(f"{g.get('cc')}: {g.get('event')} ×{g.get('n')}"
+                     for g in groups[:6])
+    out = [WorldEvent(
+        title=f"Global severe weather (WMO): {severe} severe / {extreme} extreme alerts, {countries} countries"[:240],
+        summary=f"Top alert groups — {top}."[:2000],
+        category="weather", source="wmo", lat=None, lng=None,
+        url="https://severeweather.wmo.int", salience=min(0.7, 0.4 + extreme * 0.005),
+        raw={},
+    )]
+    seen: set[str] = set()
+    for a in (data.get("extreme") or [])[:8]:
+        key = f"{a.get('cc')}|{a.get('event')}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(WorldEvent(
+            title=f"EXTREME weather ({a.get('cc')}): {a.get('event')}"[:240],
+            summary=f"{a.get('headline', '')} Area: {a.get('area', '')}"[:2000],
+            category="weather", source="wmo", lat=None, lng=None,
+            url="https://severeweather.wmo.int", salience=0.8, raw={},
+        ))
+    return out
+
+
+def _mil_flights_events(data: dict) -> list[WorldEvent]:
+    """adsb.lol military ADS-B: aggregate airborne military aircraft into 10°
+    grid clusters — a posture/surge signal, not a tracking product. One global
+    rollup always, plus the densest clusters with centroid coords."""
+    ac = [a for a in (data.get("ac") or [])
+          if isinstance(a.get("lat"), (int, float)) and isinstance(a.get("lon"), (int, float))]
+    cells: dict[tuple[int, int], list[dict]] = {}
+    for a in ac:
+        cells.setdefault((int(a["lat"] // 10), int(a["lon"] // 10)), []).append(a)
+    ranked = sorted(cells.items(), key=lambda kv: -len(kv[1]))
+    out = [WorldEvent(
+        title=f"Military air activity: {len(ac)} aircraft airborne worldwide (ADS-B)"[:240],
+        summary=("Densest areas — " + " · ".join(
+            f"{len(v)} near ({k[0]*10+5},{k[1]*10+5})" for k, v in ranked[:5]))[:2000],
+        category="military", source="adsb-mil", lat=None, lng=None,
+        url="https://adsb.lol", salience=0.45, raw={},
+    )]
+    for (klat, klon), v in ranked[:6]:
+        if len(v) < 8:   # sparse cells are routine traffic, not posture
+            continue
+        lat = sum(a["lat"] for a in v) / len(v)
+        lng = sum(a["lon"] for a in v) / len(v)
+        types = Counter(a.get("type") or "?" for a in v)
+        tt = ", ".join(f"{t}×{n}" for t, n in types.most_common(4))
+        out.append(WorldEvent(
+            title=f"Military air concentration: {len(v)} aircraft near ({lat:.0f}, {lng:.0f})"[:240],
+            summary=f"Types: {tt}."[:2000],
+            category="military", source="adsb-mil", lat=lat, lng=lng,
+            # ADS-B density tracks receiver coverage (US/EU-heavy), and big CONUS
+            # clusters are routine training traffic — cap below the hot tier.
+            url="https://adsb.lol", salience=min(0.7, 0.4 + len(v) * 0.015), raw={},
+        ))
+    return out
+
+
+def _ransomware_events(data: dict) -> list[WorldEvent]:
+    """ransomware.live claimed victims: the actor/victim layer of the cyber
+    picture. One rollup always; fresh (≤48h) claims individually, critical
+    sectors raised. Victim descriptions are untrusted leak-site text — the
+    route truncates them and they ride along as display-only summary."""
+    victims = data.get("victims") or []
+    groups = Counter(v.get("group") or "?" for v in victims)
+    gg = " · ".join(f"{g} ×{n}" for g, n in groups.most_common(5))
+    out = [WorldEvent(
+        title=f"Ransomware tape: {len(victims)} recently claimed victims"[:240],
+        summary=f"Most active groups — {gg}."[:2000],
+        category="cyber", source="ransomware", lat=None, lng=None,
+        url="https://www.ransomware.live", salience=0.4, raw={},
+    )]
+    cutoff = datetime.now(timezone.utc).timestamp() - 48 * 3600
+    critical = re.compile(
+        r"financial|health|hospital|energy|utilit|government|defen[cs]e|transport|telecom|water",
+        re.I)
+    fresh = 0
+    for v in victims:
+        try:
+            ts = datetime.fromisoformat(str(v.get("discovered", "")).replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if ts.timestamp() < cutoff:
+                continue
+        except ValueError:
+            continue
+        fresh += 1
+        if fresh > 10:
+            break
+        crit = bool(critical.search(v.get("sector") or ""))
+        out.append(WorldEvent(
+            title=f"Ransomware claim: {v.get('victim', '?')} ({v.get('country', '??')}) by {v.get('group', '?')}"[:240],
+            summary=f"Sector: {v.get('sector', '?')}. {v.get('description', '')}"[:2000],
+            category="cyber", source="ransomware", lat=None, lng=None,
+            url="https://www.ransomware.live",
+            salience=0.7 if crit else 0.55, raw={},
+        ))
+    return out
+
+
 class OsirisIntake:
     def __init__(self, base_url: str | None = None):
         self.base = (base_url or CONFIG.osiris_url).rstrip("/")
@@ -966,6 +1078,12 @@ class OsirisIntake:
                     out.extend(_ofac_events(data))
                 elif source == "hackernews":
                     out.extend(_hackernews_events(data))
+                elif source == "wmo":
+                    out.extend(_wmo_events(data))
+                elif source == "adsb-mil":
+                    out.extend(_mil_flights_events(data))
+                elif source == "ransomware":
+                    out.extend(_ransomware_events(data))
                 elif source == "hungermap":
                     out.extend(_summary_signal(data, "hungermap", "food", "Food insecurity — worst-hit"))
                 elif source == "wb-unemployment":
